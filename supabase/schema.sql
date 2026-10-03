@@ -34,7 +34,7 @@ create table if not exists spike_alerts (
   lift        numeric not null,
   spike_type  text,
   confidence  numeric,
-  status      text not null default 'claimed',  -- claimed | sent_to_rep | routed_to_revops | marked_sent | not_useful | snoozed | skipped_no_owner
+  status      text not null default 'claimed',  -- claimed | sent_to_rep | routed_to_revops | marked_sent | not_useful | snoozed | skipped_no_owner | failed
   slack_channel text,
   slack_ts    text,
   created_at  timestamptz not null default now(),
@@ -42,7 +42,14 @@ create table if not exists spike_alerts (
   unique (account_id, window_end)                -- same-day reruns can never double-alert
 );
 
--- Spike detection: last 14 days vs the prior 28, with a relative AND absolute bar
+-- Lock the tables down. The app only uses the service-role key, which bypasses
+-- row-level security; with RLS on and no policies, the public anon key sees nothing.
+alter table product_usage_daily enable row level security;
+alter table contracts           enable row level security;
+alter table reps                enable row level security;
+alter table spike_alerts        enable row level security;
+
+-- Spike detection: last 14 days (today included) vs the prior 28, with a relative AND absolute bar
 create or replace function detect_spikes(
   lift_threshold numeric default 1.5,
   min_abs_increase numeric default 500
@@ -52,13 +59,13 @@ language sql stable as $$
   with daily as (
     select account_id, usage_date, sum(gpu_minutes) as gpu_min
     from product_usage_daily
-    where usage_date >= current_date - 42
+    where usage_date > current_date - 42
     group by 1, 2
   ),
   w as (
     select account_id,
-      avg(gpu_min) filter (where usage_date >= current_date - 14) as recent_avg,
-      avg(gpu_min) filter (where usage_date <  current_date - 14) as baseline_avg
+      avg(gpu_min) filter (where usage_date >  current_date - 14) as recent_avg,    -- 14 days
+      avg(gpu_min) filter (where usage_date <= current_date - 14) as baseline_avg   -- 28 days
     from daily
     group by 1
   )

@@ -52,11 +52,34 @@ const CASES: { name: string; expected: "expansion" | "risk" | "commit"; input: D
   },
 ];
 
+// The email goes to the customer, so it must not reveal that we watch their usage.
+const LEAKS = /\b(usage|spike|burst|surge|traffic|noticed|monitor\w*|gpu)\b|\bwe (saw|see|have seen|'ve seen)\b|\d+(\.\d+)?\s*(%|x\b)|\b(jan|feb|mar|apr|may|jun|jul|aug|sep|oct|nov|dec)[a-z]*\.?\s+\d{1,2}\b/i;
+const flat = (s: string) => s.toLowerCase().replace(/[^a-z0-9]/g, "");
+
+function emailLeaks(email: string, input: DraftInput): string[] {
+  const hits: string[] = [];
+  const m = email.match(LEAKS);
+  if (m) hits.push(`"${m[0]}"`);
+  for (const dep of input.usage.breakdown) {
+    if (flat(email).includes(flat(dep.model_name))) hits.push(`model ${dep.model_name}`);
+  }
+  return hits;
+}
+
 async function main() {
   const results = [];
   for (const c of CASES) {
     const d = await draftOutreach(c.input);
-    results.push({ case: c.name, expected: c.expected, got: d.spike_type, confidence: d.confidence, pass: d.spike_type === c.expected ? "PASS" : "FAIL" });
+    const leaks = emailLeaks(`${d.email_subject}\n${d.email_body}`, c.input);
+    const labelOk = d.spike_type === c.expected;
+    results.push({
+      case: c.name,
+      expected: c.expected,
+      got: d.spike_type,
+      confidence: d.confidence,
+      email: leaks.length ? `LEAK ${leaks.join(", ")}` : "clean",
+      pass: labelOk && leaks.length === 0 ? "PASS" : "FAIL",
+    });
     console.log(`\n--- ${c.name} ---\n${d.rep_summary}\nSubject: ${d.email_subject}\n${d.email_body}`);
   }
   console.log();

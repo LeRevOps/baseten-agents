@@ -1,4 +1,4 @@
-import { NextResponse } from "next/server";
+import { NextResponse, after } from "next/server";
 import { verifySlackSignature } from "@/lib/slack";
 import { updateAlert } from "@/lib/db";
 
@@ -26,12 +26,14 @@ export async function POST(req: Request) {
 
   await updateAlert(Number(action.value), { status });
 
-  // Reply in the thread via response_url; Slack needs our 200 within 3 seconds.
+  // Slack needs our 200 within 3 seconds, so the confirmation message goes out after the response.
   if (payload.response_url) {
-    await fetch(payload.response_url, {
-      method: "POST",
-      headers: { "Content-Type": "application/json" },
-      body: JSON.stringify({ response_type: "in_channel", replace_original: false, text: CONFIRM[status] }),
+    after(async () => {
+      await fetch(payload.response_url, {
+        method: "POST",
+        headers: { "Content-Type": "application/json" },
+        body: JSON.stringify({ response_type: "in_channel", replace_original: false, text: CONFIRM[status] }),
+      });
     });
   }
   return new NextResponse(null, { status: 200 });

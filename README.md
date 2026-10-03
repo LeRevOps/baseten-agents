@@ -1,10 +1,12 @@
 # Inference spike agent
 
-Finds accounts whose inference usage spiked in the last 14 days, pulls the account and best contact from Salesforce, finds the owning rep, has Claude classify the spike and draft outreach, and DMs the rep in Slack. Never alerts the same spike twice. Nudges the rep if nobody acts.
+Finds accounts whose inference usage spiked, pulls the account and best contact from Salesforce, finds the owning rep, has Claude classify the spike and draft outreach, and DMs the rep in Slack with buttons. It never alerts the same spike twice, and it nudges the rep if nobody acts.
 
-Stack: Next.js on Vercel, Workflow SDK (durable workflows), Supabase (stands in for the warehouse), Salesforce REST API, Slack, Claude, optional Clay.
+Detection and routing are rules. Claude does only the part rules can't: reading the shape of a spike and writing the message.
 
-## How it fits together
+**Stack:** Next.js on Vercel, Workflow SDK (durable workflows), Supabase Postgres (stands in for a warehouse), Salesforce REST API, Slack, Claude. Clay enrichment is optional.
+
+## How it works
 
 ```
 Vercel cron ─► /api/scan ─► spikeScanWorkflow
@@ -14,98 +16,113 @@ Vercel cron ─► /api/scan ─► spikeScanWorkflow
                                    3 pick contact (+ Clay, optional) Salesforce, Clay
                                    4 usage breakdown + rep lookup    Supabase
                                    5 classify + draft                Claude
-                                   6 DM rep (or RevOps if unsure)    Slack
+                                   6 DM the rep, or RevOps if unsure Slack
                                    7 sleep 48h, nudge if ignored     Workflow SDK
 Slack buttons ─► /api/slack/interactions ─► spike_alerts.status
 ```
 
-| File | What it does |
+| File | Role |
 |---|---|
 | `workflows/spike-alert.ts` | Both workflows and every step. Start here. |
-| `config/spike.ts` | All thresholds in one place |
-| `supabase/schema.sql` | Tables + `detect_spikes()` SQL |
+| `config/spike.ts` | Every threshold in one place |
+| `supabase/schema.sql` | Tables, row-level security, and the `detect_spikes()` SQL function |
 | `lib/db.ts` | Dedupe (`claimAlert`), usage breakdown, rep lookup |
-| `lib/salesforce.ts` | Auth, SOQL, contact-picking rules |
-| `lib/claude.ts` | Classification + draft with forced structured output |
-| `lib/slack.ts` | Message blocks, signature verification |
-| `scripts/seed.ts` | Fake usage with 3 planted spikes + Salesforce CSVs |
-| `scripts/eval.ts` | Checks Claude labels the 3 spikes correctly |
+| `lib/salesforce.ts` | OAuth client credentials, SOQL, contact-picking rules |
+| `lib/claude.ts` | Classification and drafting with schema-validated structured output |
+| `lib/slack.ts` | Block Kit messages, request signature verification |
+| `scripts/seed.ts` | 60 days of fake usage with 3 planted spikes, plus Salesforce import CSVs |
+| `scripts/eval.ts` | Checks Claude labels the 3 planted spikes correctly and keeps usage out of customer emails |
 
-## Setup, in order
+## Design decisions
 
-Do the credentials first. Salesforce auth is where most of the friction is.
+- **A durable workflow, not an API route.** The route returns in milliseconds. A Clay lookup can take minutes, the nudge waits 48 hours, and any step can fail. Each step is checkpointed, retried, and never re-run once it succeeds.
+- **One child run per spike.** A slow or failing account can't block the others.
+- **Detection is SQL.** `detect_spikes()` compares the last 14 days to the prior 28 and requires both a relative lift (1.5x) and an absolute increase (500 GPU minutes/day). Either bar alone produces false positives in one direction.
+- **Rules for contacts and routing, AI for judgment.** Contact picking prefers the most recently active technical title; routing follows the Salesforce owner. Both are auditable. Claude only classifies (expansion, risk, commit) and writes.
+- **Two outputs with different audiences.** The rep gets the numbers. The customer email never mentions usage, GPU figures, dates, spikes, or which models they run.
+- **Structured output through a strict tool schema.** The API validates Claude's arguments against the schema; a missing tool call is a hard failure.
+- **Failure routes to a human.** Low confidence (< 0.7), no rep mapping, no CRM match, and exhausted retries all go to a RevOps channel. Nothing is dropped silently.
+- **Adoption is measured.** Button clicks write `spike_alerts.status` (`marked_sent`, `not_useful`, `snoozed`), so you can see whether reps use the alerts.
 
-### 1. Install
+## Reliability and security
+
+- **No repeats, two layers.** A unique `(account_id, window_end)` constraint stops same-day reruns at the database. A 14-day cooldown stops the same spike on later days unless its lift grew 1.5x. Failed alerts don't count toward the cooldown, so the next scan retries them.
+- **Retries.** A thrown error is retried (3 attempts by default). Salesforce 4xx responses throw `FatalError` because retrying can't fix bad credentials; 429 and 5xx are retried.
+- **Scan endpoint** requires `CRON_SECRET` and rejects everything while it is unset.
+- **Slack requests** are verified with an HMAC signature, a 5-minute replay window, and a constant-time compare.
+- **Secrets stay server-side.** The Supabase service-role key bypasses row-level security, so it is never exposed to a browser. Tables have RLS enabled with no policies.
+
+## Evaluation
+
+```bash
+npm run eval
+```
+
+Runs the three planted spike shapes through Claude and checks that each is labeled correctly (expansion, risk, commit) and that the customer email contains no usage details. It needs only `ANTHROPIC_API_KEY`. It does not test routing or email quality beyond the leak check.
+
+## Running it
+
+**Prerequisites**
+
+- Node 20+, an Anthropic API key
+- A Supabase project
+- A Salesforce org (a free Developer Edition works) with:
+  - a text field on Account, `Baseten_Org_Id__c`, marked **External ID** and **Unique**
+  - an External Client App with the OAuth **Client Credentials Flow** enabled, scopes `api` and `refresh_token`, and a **Run As** user
+- A Slack app with bot scopes `chat:write` and `im:write`, interactivity pointed at `/api/slack/interactions`, and a `#revops-alerts` channel the bot is in
+
+**Setup**
+
 ```bash
 npm install
-cp .env.example .env.local   # also copy to .env for the scripts
+cp .env.example .env.local   # Next.js reads this
+cp .env.example .env         # the scripts read this
+# fill in the values (see below)
+
+# run supabase/schema.sql in the Supabase SQL editor
+npm run seed                 # prints the spikes it planted: org_003, org_007, org_011
+# import salesforce/accounts.csv, then contacts.csv, with Data Import Wizard
+npm run eval
 ```
 
-### 2. Anthropic (5 min) and the eval
-Add `ANTHROPIC_API_KEY`, then `npm run eval`. This works with nothing else configured and is the fastest early win.
+**Run**
 
-### 3. Supabase (15 min)
-Create a project. In the SQL editor, run `supabase/schema.sql`. Add `SUPABASE_URL` and `SUPABASE_SERVICE_ROLE_KEY` (server-side only, never ship it to a browser).
-
-### 4. Salesforce (45-90 min)
-1. Sign up for a free Developer Edition org.
-2. Setup > Object Manager > Account > Fields: create text field **Baseten Org Id** (`Baseten_Org_Id__c`), marked **External ID** and **Unique**.
-3. Setup > External Client App Manager > New. Enable OAuth, enable **Client Credentials Flow**, scopes `api` and `refresh_token`. In its policies, set the **Run As** user to yourself. Copy the consumer key and secret into `SF_CLIENT_ID` / `SF_CLIENT_SECRET`. `SF_LOGIN_URL` is your My Domain URL.
-   - If the UI looks different, search Salesforce Help for "client credentials flow". Salesforce has been moving from Connected Apps to External Client Apps.
-4. Find your 18-character user Id (Setup > Users > your user; or run `SELECT Id FROM User WHERE Username = '...'` in Developer Console). Put it in `REP_SFDC_USER_ID`.
-
-### 5. Seed data
-```bash
-npm run seed
-```
-Confirm the printed table shows exactly `org_003`, `org_007`, `org_011`. Then in Salesforce, use **Data Import Wizard** to import `salesforce/accounts.csv` (map Baseten Org Id) and then `salesforce/contacts.csv` (match contacts to accounts by Account Name). Accounts you import are owned by you, which is why the rep mapping works.
-
-### 6. Slack (30 min)
-1. Create a free workspace and a Slack app (api.slack.com/apps).
-2. Bot token scopes: `chat:write`, `im:write`. Install to workspace. Copy `SLACK_BOT_TOKEN` and `SLACK_SIGNING_SECRET`.
-3. Interactivity: on, request URL `https://YOUR-URL/api/slack/interactions`.
-4. Create a `#revops-alerts` channel, invite the bot, put its channel Id in `SLACK_REVOPS_CHANNEL_ID`.
-5. Your member Id (profile > ... > Copy member ID) goes in `REP_SLACK_USER_ID`. Re-run `npm run seed` after setting it.
-
-### 7. Run it
 ```bash
 npm run dev
 curl -X POST http://localhost:3000/api/scan -H "Authorization: Bearer $CRON_SECRET"
-npx workflow web          # visual run inspector: every step, input, output, retry
+npx workflow web             # visual inspector: every step, input, output, retry
 ```
-Locally, Slack buttons and Clay callbacks need a public URL: use ngrok, or just deploy (`vercel deploy`) and test there. On Vercel, add every env var in Project Settings first.
 
-If you ever add a `proxy.ts`/middleware, exclude `.well-known/workflow` from its matcher or workflows will silently never run.
+Slack buttons and Clay callbacks need a public URL, so use a tunnel or deploy (`vercel deploy`). On Vercel, add every variable under Project Settings first. The daily cron is defined in `vercel.json`.
 
-### 8. Clay (optional, half a day)
-1. Create a table with a **webhook** source. Put its URL in `CLAY_WEBHOOK_URL`.
-2. Add an enrichment that finds the contact's current title (from `contact_email` / `contact_name` + `company`).
-3. Add an **HTTP API** column: POST to `{{callback_url}}`, header `x-callback-secret: <CLAY_CALLBACK_SECRET>`, body `{"title": "{{enriched title}}"}`.
-4. Check early whether your Clay plan includes HTTP API columns. If not, the workflow still runs: it times out after `clayTimeout` and marks the contact "not enriched".
+If you add a `proxy.ts` or middleware, exclude `.well-known/workflow` from its matcher, or workflows will silently never run.
 
-## Demo script (about 10 minutes)
+**Environment**
 
-1. **Data.** Show `product_usage_daily` and the three planted shapes. Show `config/spike.ts`: "These are guesses I'd tune with sales."
-2. **Low-code version first (optional).** Show the n8n flow (below): "80% in an hour. Here's what it can't do."
-3. **Trigger the scan.** DMs arrive. Open the Acme one and walk through it.
-4. **Inspector.** `npx workflow web`: each step's input and output, retries, the child run per account.
-5. **No repeats.** Trigger again. Nothing new arrives. Show `spike_alerts`.
-6. **Adoption.** Click Not useful. Show the status change. "That's how I'd know if reps use this."
-7. **Judgment.** Contact picking and routing are rules, not AI. Claude only does the part rules can't: reading the shape of the spike and writing the message. Low confidence goes to RevOps, not the rep.
-8. **Eval.** `npm run eval`: 3/3 with known answers.
+| Variable | Purpose |
+|---|---|
+| `ANTHROPIC_API_KEY`, `ANTHROPIC_MODEL` | Claude |
+| `SUPABASE_URL`, `SUPABASE_SERVICE_ROLE_KEY` | Database (service key is server-side only) |
+| `SF_LOGIN_URL`, `SF_CLIENT_ID`, `SF_CLIENT_SECRET` | Salesforce My Domain URL and External Client App credentials |
+| `SLACK_BOT_TOKEN`, `SLACK_SIGNING_SECRET`, `SLACK_REVOPS_CHANNEL_ID` | Slack |
+| `CRON_SECRET` | Required. Protects `/api/scan` |
+| `REP_SFDC_USER_ID`, `REP_SLACK_USER_ID`, `REP_NAME` | Seeding: maps the demo accounts' owner to a Slack user |
+| `APP_BASE_URL` | Public base URL for callbacks |
+| `CLAY_WEBHOOK_URL`, `CLAY_CALLBACK_SECRET` | Optional Clay enrichment. Leave blank to skip it |
 
-To demo the nudge live, set `nudgeAfter: "2m"` in `config/spike.ts`.
+## Tuning
 
-## n8n comparison (1-2 hours, optional)
+Every threshold lives in `config/spike.ts`: lift and absolute-increase bars, cooldown, re-alert multiplier, confidence floor, Clay timeout, nudge delay. They are starting guesses, meant to be tuned with sales against real usage. Set `nudgeAfter: "2m"` to watch the follow-up happen live.
 
-Build: **Schedule Trigger** > **Postgres** node (connect to Supabase, run `select * from detect_spikes(1.5, 500)`) > **Slack** node posting each row to a channel. That's it.
+## Optional: Clay enrichment
 
-What it can't do, which is the point: it re-alerts every day for two weeks (no memory), can't tell an expansion from an outage, has no Salesforce context or rep routing, and has no way to measure whether anyone acted.
+If `CLAY_WEBHOOK_URL` is set, the workflow sends the contact to a Clay table and waits for the result through a webhook, racing it against a timeout (`Promise.race` with `sleep`). If Clay never answers, the alert goes out anyway and says the contact wasn't enriched. Clay's side needs a table with a webhook source, a title enrichment, and an HTTP API column that POSTs back to the callback URL with an `x-callback-secret` header. HTTP API columns may require a paid Clay plan.
 
-## Questions this build answers
+## Known limitations
 
-- **Why a workflow and not an API route?** The route returns in milliseconds. Clay can take minutes, the nudge waits 48 hours, and any step can fail. Each step is checkpointed, retried, and never re-run once it succeeds.
-- **Duplicate runs?** Unique `(account_id, window_end)` plus a cooldown that only re-alerts if the spike escalated.
-- **Clay never responds?** Durable `Promise.race` against `sleep`. Continue without enrichment and say so in the DM.
-- **Bad AI output?** Forced structured output, a confidence threshold that routes to RevOps, and an eval with known answers.
-- **Production at Baseten?** Real warehouse instead of Supabase, secrets management, alerting on failed runs, a Salesforce sandbox-to-prod path, and an owner for the thresholds.
+- Spike thresholds and the 0.7 confidence floor are untuned. The model's confidence is self-reported, not calibrated.
+- The Snooze button records a status; it doesn't suppress anything beyond the existing cooldown.
+- `reps.manager_slack_id` is stored but nothing escalates to a manager yet.
+- Anyone who can see an alert message can click its buttons.
+- A new Salesforce token is requested on every query. Fine at this scale; cache it for production.
+- Supabase stands in for the warehouse. A production version would query the real warehouse, use a secrets manager, alert on failed runs, and promote through a Salesforce sandbox first.

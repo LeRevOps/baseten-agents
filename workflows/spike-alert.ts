@@ -1,4 +1,4 @@
-import { sleep, createWebhook, FatalError } from "workflow";
+import { sleep, createWebhook } from "workflow";
 import { start } from "workflow/api";
 import { SPIKE_CONFIG } from "@/config/spike";
 import * as dbLib from "@/lib/db";
@@ -33,6 +33,17 @@ export async function spikeAlertWorkflow(spike: Spike, windowEnd: string) {
   const alertId = await claim(spike, windowEnd);
   if (alertId === null) return { result: "skipped: already alerted" };
 
+  // Steps retry on their own. If one still fails for good, the claim must not
+  // leave a silent hole: mark it failed (so tomorrow's scan can retry) and tell RevOps.
+  try {
+    return await processClaimedAlert(spike, alertId);
+  } catch (err) {
+    await failAlert(alertId, spike, String(err));
+    return { result: "failed", alertId };
+  }
+}
+
+async function processClaimedAlert(spike: Spike, alertId: number) {
   // 2. CRM context (join product org id -> Salesforce Account)
   const account = await fetchAccount(spike.account_id);
   if (!account) {
@@ -126,13 +137,9 @@ async function claim(spike: Spike, windowEnd: string) {
 
 async function fetchAccount(orgId: string) {
   "use step";
-  try {
-    return await sf.getAccountByOrgId(orgId);
-  } catch (err) {
-    // Bad credentials won't fix themselves: stop instead of retrying forever
-    if (String(err).includes("auth failed")) throw new FatalError(String(err));
-    throw err;
-  }
+  // lib/salesforce.ts throws FatalError for 4xx (bad credentials won't fix themselves)
+  // and a plain Error for 429/5xx, which the SDK retries.
+  return sf.getAccountByOrgId(orgId);
 }
 
 async function fetchContact(accountId: string) {
@@ -156,7 +163,7 @@ async function sendToClay(contact: SfContact, account: SfAccount, callbackUrl: s
 }
 
 async function isValidClaySecret(secret: string | null) {
-  "use step"; // runs in a step so the secret never lands in the workflow event log
+  "use step"; // keeps process.env out of the replayed workflow body. Note: step inputs, including the received header value, are recorded in the event log (encrypted on Vercel).
   return Boolean(secret) && secret === process.env.CLAY_CALLBACK_SECRET;
 }
 
@@ -203,6 +210,18 @@ async function routeToRevOps(alertId: number, text: string) {
   "use step";
   await slack.postMessage(process.env.SLACK_REVOPS_CHANNEL_ID!, text);
   await dbLib.updateAlert(alertId, { status: "skipped_no_owner" });
+}
+
+async function failAlert(alertId: number, spike: Spike, reason: string) {
+  "use step";
+  // Only if nothing was delivered yet: a failure after delivery (e.g. the nudge) must not overwrite the status.
+  const failed = await dbLib.failIfClaimed(alertId);
+  if (failed) {
+    await slack.postMessage(
+      process.env.SLACK_REVOPS_CHANNEL_ID!,
+      `Spike alert for org \`${spike.account_id}\` (${spike.lift}x) failed after retries and was NOT sent: ${reason.slice(0, 300)}. Tomorrow's scan will try again.`
+    );
+  }
 }
 
 async function nudgeIfIgnored(alertId: number, channel: string, ts: string) {

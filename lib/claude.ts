@@ -15,7 +15,7 @@ You get facts about an account whose GPU usage spiked in the last 14 days. Do th
 
 3. Write an email to the contact from the AE:
    - Short (under 90 words), warm, specific, one clear ask.
-   - Never quote raw usage percentages or say "we noticed your usage". It should read as a helpful check-in, not surveillance.
+   - The customer must never learn we are watching their usage. In the email, do not mention usage, GPU numbers, percentages, multipliers, specific dates, spikes, bursts, traffic patterns, or which models/deployments they run. It should read as a helpful check-in, not surveillance. Those details belong in rep_summary only.
    - Tone follows the classification: expansion = help scaling; risk = offer engineering help; commit = plan ahead together.
    - Sign off with "[Your name]".
 

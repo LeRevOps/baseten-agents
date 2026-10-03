@@ -1,6 +1,13 @@
+import { FatalError } from "workflow";
 import type { SfAccount, SfContact } from "./types";
 
 const API = "v62.0";
+
+// Workflow SDK semantics: any thrown Error is retried (3 attempts by default);
+// FatalError stops immediately. So 429/5xx stay plain Errors, and 4xx
+// (bad credentials, bad query) are fatal because retrying can't fix them.
+const failFor = (status: number, message: string) =>
+  status === 429 || status >= 500 ? new Error(message) : new FatalError(message);
 
 // OAuth 2.0 Client Credentials flow (server-to-server, no user login).
 // Set up in Salesforce: Setup > External Client App Manager > New, enable OAuth,
@@ -15,7 +22,7 @@ async function getToken(): Promise<{ token: string; instanceUrl: string }> {
       client_secret: process.env.SF_CLIENT_SECRET!,
     }),
   });
-  if (!res.ok) throw new Error(`Salesforce auth failed: ${res.status} ${await res.text()}`);
+  if (!res.ok) throw failFor(res.status, `Salesforce auth failed: ${res.status} ${await res.text()}`);
   const json = await res.json();
   return { token: json.access_token, instanceUrl: json.instance_url };
 }
@@ -25,11 +32,7 @@ export async function soql<T>(query: string): Promise<T[]> {
   const res = await fetch(`${instanceUrl}/services/data/${API}/query?q=${encodeURIComponent(query)}`, {
     headers: { Authorization: `Bearer ${token}` },
   });
-  if (res.status === 429 || res.status >= 500) {
-    // Transient: let the workflow step retry
-    throw Object.assign(new Error(`Salesforce ${res.status}`), { retryable: true });
-  }
-  if (!res.ok) throw new Error(`SOQL failed: ${res.status} ${await res.text()}`);
+  if (!res.ok) throw failFor(res.status, `SOQL failed: ${res.status} ${await res.text()}`);
   return (await res.json()).records as T[];
 }
 
@@ -54,7 +57,8 @@ export async function getAccountByOrgId(orgId: string): Promise<SfAccount | null
 }
 
 // Deterministic contact selection: auditable, no AI needed.
-const TECH_TITLES = /(ml|machine learning|ai|platform|infra|engineer|cto|vp eng|head of eng)/i;
+// Word-bounded so "Director" (contains "cto") or "Training" (contains "ai") don't count as technical.
+const TECH_TITLES = /\b(ml|ai|cto|machine learning|platform|infra\w*|engineer\w*|vp eng\w*|head of eng\w*)\b/i;
 
 export async function pickContact(accountId: string): Promise<SfContact | null> {
   const rows = await soql<Record<string, any>>(

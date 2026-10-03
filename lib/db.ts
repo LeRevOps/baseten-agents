@@ -37,6 +37,7 @@ export async function claimAlert(spike: Spike, windowEnd: string): Promise<numbe
     .from("spike_alerts")
     .select("lift")
     .eq("account_id", spike.account_id)
+    .neq("status", "failed") // a failed alert never reached anyone, so it must not suppress the retry
     .gte("created_at", since)
     .order("created_at", { ascending: false })
     .limit(1);
@@ -62,10 +63,10 @@ export async function getUsageContext(accountId: string): Promise<UsageContext> 
     .from("product_usage_daily")
     .select("usage_date, deployment_id, model_name, gpu_minutes")
     .eq("account_id", accountId)
-    .gte("usage_date", isoDay(42 * DAY));
+    .gte("usage_date", isoDay(41 * DAY)); // same windows as detect_spikes(): 28 baseline days + 14 recent days, today included
   if (error) throw new Error(error.message);
 
-  const cutRecent = isoDay(14 * DAY);
+  const cutRecent = isoDay(13 * DAY);
   const byDep = new Map<string, { model: string; recent: number; base: number; first: string }>();
   const byDay = new Map<string, number>();
 
@@ -123,6 +124,18 @@ export async function updateAlert(id: number, fields: Record<string, unknown>) {
     .update({ ...fields, updated_at: new Date().toISOString() })
     .eq("id", id);
   if (error) throw new Error(error.message);
+}
+
+/** Marks an alert failed only if nothing was delivered yet. Returns true if it changed. */
+export async function failIfClaimed(id: number): Promise<boolean> {
+  const { data, error } = await db()
+    .from("spike_alerts")
+    .update({ status: "failed", updated_at: new Date().toISOString() })
+    .eq("id", id)
+    .eq("status", "claimed")
+    .select("id");
+  if (error) throw new Error(error.message);
+  return (data?.length ?? 0) > 0;
 }
 
 export async function getAlertStatus(id: number): Promise<string | null> {
