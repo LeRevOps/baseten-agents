@@ -44,6 +44,26 @@ Slack buttons ─► /api/slack/interactions ─► spike_alerts.status
 - **Failure routes to a human.** Low confidence (< 0.7), no rep mapping, no CRM match, and exhausted retries all go to a RevOps channel. Nothing is dropped silently.
 - **Adoption is measured.** Button clicks write `spike_alerts.status` (`marked_sent`, `not_useful`, `snoozed`), so you can see whether reps use the alerts.
 
+## When low-code is the right call
+
+The quick version of this agent is a three-node n8n flow: a schedule trigger, a Postgres node running `select * from detect_spikes(1.5, 500)`, and a Slack node posting each row. That gets alerts out in an hour, and for a plain "tell me when X crosses Y" notification it is the right tool.
+
+It stops being enough where this build starts:
+
+| Need | Quick low-code flow | This build |
+|---|---|---|
+| Don't repeat | Re-alerts every day while the spike stays in the window | Unique constraint plus cooldown that only re-alerts on escalation |
+| Tell expansion from an outage | Can't. Every spike looks the same | Claude reads the shape; low confidence goes to a human |
+| Who owns it | One channel, no CRM context | Salesforce account, best contact, and owner routing |
+| Survive failure and long waits | A failed node restarts the run or drops it | Checkpointed steps, retries, a 48-hour durable wait |
+| Know whether it helped | Nothing | Button clicks are an adoption signal |
+
+The split I'd use in practice:
+
+- **Low-code (n8n, Zapier, Make):** simple notifications, glue between two tools, and prototypes to prove demand before building anything durable.
+- **Clay:** enrichment, where its provider waterfall beats anything worth building. Here it fills in a contact's current title, with the workflow continuing if Clay never answers.
+- **Custom (this repo):** state, durable waits, branching on judgment, and measurement.
+
 ## Reliability and security
 
 - **No repeats, two layers.** A unique `(account_id, window_end)` constraint stops same-day reruns at the database. A 14-day cooldown stops the same spike on later days unless its lift grew 1.5x. Failed alerts don't count toward the cooldown, so the next scan retries them.
