@@ -1,0 +1,9 @@
+node_modules
+.next
+.env
+.env.local
+/.swc
+.swc
+app/.well-known/workflow
+*.tsbuildinfo
+CLAUDE.md

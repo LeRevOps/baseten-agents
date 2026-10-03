@@ -1,0 +1,27 @@
+{
+  "name": "spike-agent",
+  "private": true,
+  "scripts": {
+    "dev": "next dev",
+    "build": "next build",
+    "seed": "tsx scripts/seed.ts",
+    "eval": "tsx scripts/eval.ts",
+    "typecheck": "tsc --noEmit"
+  },
+  "dependencies": {
+    "@anthropic-ai/sdk": "latest",
+    "@slack/web-api": "latest",
+    "@supabase/supabase-js": "latest",
+    "next": "latest",
+    "react": "latest",
+    "react-dom": "latest",
+    "workflow": "latest"
+  },
+  "devDependencies": {
+    "@types/node": "latest",
+    "@types/react": "latest",
+    "dotenv": "latest",
+    "tsx": "latest",
+    "typescript": "latest"
+  }
+}
